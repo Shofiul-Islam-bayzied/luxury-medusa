@@ -55,6 +55,7 @@ type PayStationTransaction = {
   payment_amount?: string
   payment_method?: string
   order_date_time?: string
+  reference?: string
 }
 
 type PayStationResponse = {
@@ -146,15 +147,15 @@ class PayStationProviderService extends AbstractPaymentProvider<PayStationOption
   }
 
   async authorizePayment(input: AuthorizePaymentInput): Promise<AuthorizePaymentOutput> {
-    return this.checkTransaction(input.data)
+    return this.checkTransaction(input.data, input.context?.idempotency_key)
   }
 
   async getPaymentStatus(input: GetPaymentStatusInput): Promise<GetPaymentStatusOutput> {
-    return this.checkTransaction(input.data)
+    return this.checkTransaction(input.data, input.context?.idempotency_key)
   }
 
   async retrievePayment(input: RetrievePaymentInput): Promise<RetrievePaymentOutput> {
-    const { data } = await this.checkTransaction(input.data)
+    const { data } = await this.checkTransaction(input.data, input.context?.idempotency_key)
     return { data }
   }
 
@@ -164,20 +165,54 @@ class PayStationProviderService extends AbstractPaymentProvider<PayStationOption
     return { data: input.data }
   }
 
-  // PayStation has no cancel API; unpaid checkout links simply expire.
+  // PayStation has no cancel API. Refusing to cancel a payment it already took
+  // keeps Medusa from marking a captured payment as canceled.
   async cancelPayment(input: CancelPaymentInput): Promise<CancelPaymentOutput> {
+    if (normaliseStatus(text(input.data?.trx_status)) === "success") {
+      throw new MedusaError(
+        MedusaError.Types.NOT_ALLOWED,
+        "PayStation already took this payment; refund it from the PayStation merchant panel"
+      )
+    }
     return { data: input.data }
   }
 
+  // Medusa deletes sessions when the cart changes or a new session is created,
+  // but the old PayStation link stays payable. Refuse to drop a paid invoice so
+  // the cart can still be completed with it.
   async deletePayment(input: DeletePaymentInput): Promise<DeletePaymentOutput> {
+    const invoiceNumber = text(input.data?.invoice_number)
+    if (!invoiceNumber) {
+      return { data: input.data }
+    }
+
+    let transaction: PayStationTransaction | null = null
+    try {
+      transaction = await this.fetchTransaction(invoiceNumber)
+    } catch (error) {
+      this.logger_.warn(
+        `PayStation: could not check invoice ${invoiceNumber} before deleting its session: ${(error as Error).message}`
+      )
+    }
+    if (normaliseStatus(transaction?.trx_status) === "success") {
+      throw new MedusaError(
+        MedusaError.Types.NOT_ALLOWED,
+        `PayStation invoice ${invoiceNumber} is already paid; complete the cart instead of replacing its payment`
+      )
+    }
+    this.logger_.info(`PayStation: session for unpaid invoice ${invoiceNumber} deleted`)
     return { data: input.data }
   }
 
-  async refundPayment(_input: RefundPaymentInput): Promise<RefundPaymentOutput> {
-    throw new MedusaError(
-      MedusaError.Types.NOT_ALLOWED,
-      "PayStation has no refund API. Refund the customer from the PayStation merchant panel."
+  // PayStation has no refund API, so a refund is only recorded in Medusa (as with
+  // Medusa's manual provider); the money is returned in the PayStation panel.
+  async refundPayment(input: RefundPaymentInput): Promise<RefundPaymentOutput> {
+    const amount = new BigNumber(input.amount).numeric
+    this.logger_.warn(
+      `PayStation refund of ${amount} recorded for invoice ${text(input.data?.invoice_number) ?? "unknown"}: ` +
+        "return the money from the PayStation merchant panel"
     )
+    return { data: { ...input.data, manual_refund_required: true } }
   }
 
   // The IPN is an unauthenticated POST, so its body is only used to find the
@@ -191,17 +226,30 @@ class PayStationProviderService extends AbstractPaymentProvider<PayStationOption
     }
 
     const transaction = await this.fetchTransaction(invoiceNumber)
-    if (!transaction || normaliseStatus(transaction.trx_status) !== "success") {
+    const requested = transaction ? this.requestedAmount(transaction) : undefined
+    if (!transaction || normaliseStatus(transaction.trx_status) !== "success" || requested === undefined) {
       return { action: PaymentActions.NOT_SUPPORTED }
     }
 
+    this.logger_.info(
+      `PayStation: invoice ${invoiceNumber} paid (trx ${transaction.trx_id}, ${transaction.payment_method}, ${requested})`
+    )
     return {
       action: PaymentActions.SUCCESSFUL,
-      data: {
-        session_id: toSessionId(invoiceNumber),
-        amount: new BigNumber(Number(transaction.request_amount ?? transaction.payment_amount)),
-      },
+      data: { session_id: toSessionId(invoiceNumber), amount: new BigNumber(requested) },
     }
+  }
+
+  // request_amount is what this store asked for. payment_amount includes the
+  // gateway charge when the customer pays it, so it is only a fallback without one.
+  private requestedAmount(transaction: PayStationTransaction) {
+    const raw = transaction.request_amount ?? (this.options_.pay_with_charge ? undefined : transaction.payment_amount)
+    const value = Number(raw)
+    if (raw === undefined || !Number.isFinite(value)) {
+      this.logger_.error(`PayStation invoice ${transaction.invoice_number}: response has no usable request_amount`)
+      return undefined
+    }
+    return value
   }
 
   private async createInvoice(
@@ -214,16 +262,13 @@ class PayStationProviderService extends AbstractPaymentProvider<PayStationOption
       throw new MedusaError(MedusaError.Types.INVALID_DATA, "PayStation payment amount must be greater than 0")
     }
 
+    // PayStation accepts other currency codes at initiation, but its checkout then
+    // shows "Pay BDT 0.00" and cannot be paid, so only BDT is allowed.
     const currencyCode = input.currency_code.toLowerCase()
     if (currencyCode !== "bdt") {
-      if (!this.options_.sandbox) {
-        throw new MedusaError(
-          MedusaError.Types.INVALID_DATA,
-          `PayStation settles in BDT; set the region currency to BDT (got ${currencyCode.toUpperCase()})`
-        )
-      }
-      this.logger_.warn(
-        `PayStation sandbox: charging ${currencyCode.toUpperCase()} amount ${amount} as-is; live mode only accepts BDT`
+      throw new MedusaError(
+        MedusaError.Types.INVALID_DATA,
+        `PayStation only accepts BDT; set the region currency to BDT (got ${currencyCode.toUpperCase()})`
       )
     }
 
@@ -247,7 +292,10 @@ class PayStationProviderService extends AbstractPaymentProvider<PayStationOption
       text([billing?.address_1, billing?.city, billing?.postal_code].filter(Boolean).join(", "))
 
     if (!email || !name) {
-      throw new MedusaError(MedusaError.Types.INVALID_DATA, "PayStation needs the customer's email address")
+      throw new MedusaError(
+        MedusaError.Types.INVALID_DATA,
+        "PayStation needs the customer's email: send it as data.cust_email when creating the payment session"
+      )
     }
     if (!phone) {
       throw new MedusaError(
@@ -293,17 +341,34 @@ class PayStationProviderService extends AbstractPaymentProvider<PayStationOption
       cust_phone: phone,
       cust_email: email,
       cust_address: address ?? null,
+      sandbox: !!this.options_.sandbox,
     }
   }
 
-  private async checkTransaction(data: Record<string, unknown> | undefined) {
+  // `data` is the stored session data. Medusa writes the provider's own keys
+  // (invoice_number, amount, session_id) after any storefront input, so they are
+  // trusted; the invoice is still checked against the session Medusa names.
+  private async checkTransaction(data: Record<string, unknown> | undefined, sessionHint?: string) {
     const invoiceNumber = text(data?.invoice_number)
     if (!invoiceNumber) {
       throw new MedusaError(MedusaError.Types.INVALID_DATA, "PayStation session has no invoice number")
     }
+    const sessionId = sessionHint?.startsWith("payses_") ? sessionHint : text(data?.session_id)
+    if (!sessionId || toSessionId(invoiceNumber) !== sessionId) {
+      throw new MedusaError(
+        MedusaError.Types.INVALID_DATA,
+        `PayStation invoice ${invoiceNumber} does not belong to payment session ${sessionId}`
+      )
+    }
 
     const transaction = await this.fetchTransaction(invoiceNumber)
-    const status = this.toSessionStatus(transaction, Number(data?.amount))
+    let status = this.toSessionStatus(transaction, Number(data?.amount))
+    if (transaction?.reference && transaction.reference !== sessionId) {
+      this.logger_.error(
+        `PayStation invoice ${invoiceNumber}: reference ${transaction.reference} does not match session ${sessionId}`
+      )
+      status = PaymentSessionStatus.ERROR
+    }
     const details = transaction
       ? {
           trx_status: transaction.trx_status,
@@ -319,8 +384,12 @@ class PayStationProviderService extends AbstractPaymentProvider<PayStationOption
   private toSessionStatus(transaction: PayStationTransaction | null, expectedAmount: number) {
     switch (normaliseStatus(transaction?.trx_status)) {
       case "success": {
-        const requested = Number(transaction?.request_amount ?? transaction?.payment_amount)
-        if (!Number.isFinite(expectedAmount) || Math.abs(requested - expectedAmount) > 0.01) {
+        const requested = transaction ? this.requestedAmount(transaction) : undefined
+        if (
+          requested === undefined ||
+          !Number.isFinite(expectedAmount) ||
+          Math.abs(requested - expectedAmount) > 0.01
+        ) {
           this.logger_.error(
             `PayStation invoice ${transaction?.invoice_number}: paid amount ${requested} does not match ${expectedAmount}`
           )
