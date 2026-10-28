@@ -75,6 +75,35 @@ const fileModule = process.env.S3_BUCKET
       },
     }
 
+// PayStation (pp_paystation_paystation) is registered only when credentials are
+// set. It stays in sandbox mode unless PAYSTATION_SANDBOX is exactly "false".
+const paymentModules = process.env.PAYSTATION_MERCHANT_ID
+  ? [
+      {
+        resolve: "@medusajs/medusa/payment",
+        options: {
+          providers: [
+            {
+              resolve: "./src/modules/paystation",
+              id: "paystation",
+              options: {
+                merchant_id: process.env.PAYSTATION_MERCHANT_ID,
+                password: process.env.PAYSTATION_PASSWORD,
+                sandbox: process.env.PAYSTATION_SANDBOX !== "false",
+                callback_url: process.env.PAYSTATION_CALLBACK_URL,
+                allowed_callback_origins: (process.env.PAYSTATION_CALLBACK_ORIGINS ?? "")
+                  .split(",")
+                  .map((origin) => origin.trim())
+                  .filter(Boolean),
+                pay_with_charge: process.env.PAYSTATION_PAY_WITH_CHARGE === "true",
+              },
+            },
+          ],
+        },
+      },
+    ]
+  : []
+
 // Without REDIS_URL (local dev) Medusa falls back to its in-memory modules.
 const redisModules = REDIS_URL
   ? [
@@ -134,5 +163,5 @@ module.exports = defineConfig({
     disable: process.env.DISABLE_MEDUSA_ADMIN === "true",
     backendUrl: BACKEND_URL || "/",
   },
-  modules: [fileModule, ...redisModules],
+  modules: [fileModule, ...paymentModules, ...redisModules],
 })

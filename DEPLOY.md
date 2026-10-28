@@ -54,6 +54,15 @@ Free instances have no Shell. Create admins from your machine against the extern
 3. Open `https://<service>.onrender.com/app/invite?token=<token>` and set a password.
 4. Remove your IP from the access list.
 
+## PayStation payments
+
+`apps/backend/src/modules/paystation` is a custom payment provider (`pp_paystation_paystation`) for PayStation's hosted checkout (cards, bKash, Nagad, Rocket, Upay). It is registered only when `PAYSTATION_MERCHANT_ID` is set, and stays in sandbox unless `PAYSTATION_SANDBOX=false`. The other `PAYSTATION_*` variables are in `apps/backend/.env.template`.
+
+- Enable it per region: Admin > Settings > Regions > (region) > Payment Providers.
+- Flow: the storefront creates a payment session with `provider_id: "pp_paystation_paystation"` (passing `data.cust_phone`), redirects the shopper to `payment_session.data.payment_url`, and completes the cart when PayStation sends the shopper back to `PAYSTATION_CALLBACK_URL`. The provider verifies every payment with PayStation's transaction-status API and checks the amount before Medusa marks it paid.
+- IPN: ask PayStation to send IPNs to `https://<service>.onrender.com/hooks/payment/paystation_paystation`. Medusa then completes the order even if the shopper never returns.
+- Live mode accepts BDT only, so set the region currency to BDT before going live. Refunds are done in the PayStation merchant panel; there is no refund API.
+
 ## Known limits
 
 - Product images: without `S3_*` variables, uploads go to local disk and disappear on every deploy, restart, or spin-down. Configure S3-compatible storage (Cloudflare R2, Supabase Storage, AWS S3) with the variables in `apps/backend/.env.template`.
